@@ -55,5 +55,8 @@ void randomize_tls(char *buffer, ssize_t n);
 
 //bool is_quic_initial(char *buffer, size_t bsize);
 
+void grease_tls(char *buffer, ssize_t n, int grease_mask);
+
+int split_tls_record(char *buffer, size_t bfsize, ssize_t *n, long pos);
 
 #endif

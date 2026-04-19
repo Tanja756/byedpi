@@ -514,7 +514,9 @@ static void tamp(char *buffer, size_t bfsize, ssize_t *n,
             lp = pos + 5;
         }
     }
-}
+    if (dp->grease_mask) {
+        grease_tls(buffer, *n, dp->grease_mask);
+}}
 
 
 ssize_t desync(struct poolhd *pool, 
@@ -623,8 +625,30 @@ ssize_t desync(struct poolhd *pool,
                     uniperror("send");
                 }
                 break;
-            
-            case DESYNC_SPLIT:
+                case DESYNC_TLS_SPLIT:
+                    // Убедимся, что это первый пакет и есть целая TLS-запись
+                    if (skip == 0 && curr_part == 1) {
+                        long split_pos = gen_offset(part.pos, part.flag, buffer, n, lp, &info);
+                        if (split_pos > 0 && split_pos < n - 5) {
+                            ssize_t old_n = n;
+                            if (split_tls_record(buffer, bfsize, &n, split_pos) > 0) {
+                                // Отправляем обе части одним вызовом send (или двумя отдельными?)
+                                // Здесь можно отправить весь модифицированный буфер целиком
+                                s = send(sfd, buffer, n, 0);
+                                if (s == n) {
+                                    // Успешно отправили всё, выходим из цикла, больше ничего не отправляем
+                                    *np = n;
+                                    return n - offset;
+                                }
+                                // Если отправилось меньше, обрабатываем как обычную отправку
+                                n = old_n; // восстанавливаем, если ошибка
+                            }
+                        }
+                    }
+                    // fallback к обычной отправке
+                    s = send(sfd, buffer + lp, n - lp, 0);
+                    break;
+                case DESYNC_SPLIT:
             case DESYNC_NONE:
             default:
                 s = send(sfd, buffer + lp, pos - lp, 0);

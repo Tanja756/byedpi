@@ -19,12 +19,16 @@
     #include <netinet/in.h>
     #include <netinet/tcp.h>
     #include <sys/socket.h>
+    #include <sys/stat.h>
     
     #define DAEMON
 #else
+    #include <direct.h> 
     #include <ws2tcpip.h>
     #include "win_service.h"
+
     #define close(fd) closesocket(fd)
+    #define mkdir(path, mode) _mkdir(path)
 #endif
 
 #define VERSION "17.3"
@@ -32,6 +36,7 @@
 ASSERT(sizeof(struct in_addr) == 4)
 ASSERT(sizeof(struct in6_addr) == 16)
 
+void *add(void **root, int *n, size_t ss);
 
 struct packet fake_tls = { 
     sizeof(tls_data), tls_data, 0,
@@ -121,6 +126,8 @@ static const char help_text[] = {
     "    -a, --udp-fake <count>    UDP fakes count, default 0\n"
     #ifdef __linux__
     "    -Y, --drop-sack           Drop packets with SACK extension\n"
+    "    -G, --grease <c,v,g,e>    Apply GREASE to TLS ClientHello (cipher,version,group,ext)\n"
+    "    -z, --tls-split <pos_t>   Split TLS record into two at position\n"
     #endif
 };
 
@@ -181,19 +188,52 @@ const struct option options[] = {
     {"tlsminor",      1, 0, 'm'},
     {"udp-fake",      1, 0, 'a'},
     {"def-ttl",       1, 0, 'g'},
-    {"wait-send",     0, 0, 'Z'}, //
-    {"await-int",     1, 0, 'W'}, //
+    {"wait-send",     0, 0, 'Z'},
+    {"await-int",     1, 0, 'W'},
     #ifdef __linux__
     {"drop-sack",     0, 0, 'Y'},
-    {"protect-path",  1, 0, 'P'}, //
+    {"protect-path",  1, 0, 'P'},
+    {"grease",        1, 0, 'G'},
+    {"tls-split",     1, 0, 'z'},
     #endif
     {"ipset",         1, 0, 'j'},
-    {"connect-to",    1, 0, 'C'}, //
-    {"comment",       1, 0, '#'}, //
+    {"connect-to",    1, 0, 'C'},
+    {"comment",       1, 0, '#'},
     {"cache-merge",   1, 0, '/'},
     {0}
 };
     
+
+static void ensure_cache_dir(const char *filepath) {
+    char *dir = strdup(filepath);
+    if (!dir) return;
+    char *last_slash = strrchr(dir, '/');
+#ifdef _WIN32
+    if (!last_slash) last_slash = strrchr(dir, '\\');
+#endif
+    if (last_slash) {
+        *last_slash = '\0';
+        if (mkdir(dir, 0755) && errno != EEXIST) {
+            perror("mkdir cache");
+        }
+    }
+    free(dir);
+}
+
+static void set_default_cache(void) {
+    struct desync_params *dp = params.dp;
+    while (dp) {
+        if (!dp->cache_file) {
+            char *default_path = strdup("cache/byedpi.cache");
+            if (default_path) {
+                dp->cache_file = default_path;
+                char **p = add((void **)&params.need_free, &params.need_free_n, sizeof(default_path));
+                if (p) *p = default_path;
+            }
+        }
+        dp = dp->next;
+    }
+}
 
 ssize_t parse_cform(char *buffer, size_t blen, 
         const char *str, size_t slen)
@@ -685,7 +725,6 @@ void clear_params(char *line, char **argv)
     params.dp = 0;
 }
 
-
 int parse_args(int argc, char **argv) 
 {
     int optc = sizeof(options)/sizeof(*options);
@@ -714,6 +753,7 @@ int parse_args(int argc, char **argv)
     
     long val = 0;
     char *end = 0;
+    struct part *part = NULL;   // объявление переменной part
     bool all_limited = 1;
     
     int curr_optind = 1;
@@ -746,6 +786,30 @@ int parse_args(int argc, char **argv)
         #ifdef __linux__
         case 'E':
             params.mode = MODE_TRANSPARENT;
+            break;
+        case 'z':
+            {
+                struct part *p = add((void *)&dp->parts, &dp->parts_n, sizeof(struct part));
+                if (!p) return -1;
+                if (parse_offset(p, optarg)) {
+                    invalid = 1; break;
+                }
+                p->m = DESYNC_TLS_SPLIT;
+            }
+            break;
+        case 'G':
+            end = optarg;
+            while (end && !invalid) {
+                switch (*end) {
+                    case 'c': dp->grease_mask |= GREASE_CIPHER; break;
+                    case 'v': dp->grease_mask |= GREASE_VERSION; break;
+                    case 'g': dp->grease_mask |= GREASE_GROUP; break;
+                    case 'e': dp->grease_mask |= GREASE_EXT; break;
+                    default: invalid = 1; continue;
+                }
+                end = strchr(end, ',');
+                if (end) end++;
+            }
             break;
         #endif
         
@@ -1029,26 +1093,23 @@ int parse_args(int argc, char **argv)
         case 'o':
         case 'q':
         case 'f':
-            ;
-            struct part *part = add((void *)&dp->parts,
-                &dp->parts_n, sizeof(struct part));
-            if (!part) {
-                return -1;
-            }
-            if (parse_offset(part, optarg)) {
-                invalid = 1;
-                break;
-            }
-            switch (rez) {
-                case 's': part->m = DESYNC_SPLIT;
+            {
+                struct part *p = add((void *)&dp->parts,
+                    &dp->parts_n, sizeof(struct part));
+                if (!p) {
+                    return -1;
+                }
+                if (parse_offset(p, optarg)) {
+                    invalid = 1;
                     break;
-                case 'd': part->m = DESYNC_DISORDER;
-                    break;
-                case 'o': part->m = DESYNC_OOB;
-                    break;
-                case 'q': part->m = DESYNC_DISOOB;
-                    break;
-                case 'f': part->m = DESYNC_FAKE;
+                }
+                switch (rez) {
+                    case 's': p->m = DESYNC_SPLIT; break;
+                    case 'd': p->m = DESYNC_DISORDER; break;
+                    case 'o': p->m = DESYNC_OOB; break;
+                    case 'q': p->m = DESYNC_DISOOB; break;
+                    case 'f': p->m = DESYNC_FAKE; break;
+                }
             }
             break;
             
@@ -1380,6 +1441,13 @@ int main(int argc, char **argv)
     if (status) {
         clear_params(cmd_line, argv);
         return status - 1;
+    }
+    
+    set_default_cache();                // установить пути по умолчанию
+    LOG(LOG_S, "set default cache: %s\n", params.dp->cache_file);
+    if (params.dp && params.dp->cache_file) {
+        LOG(LOG_S, "create cache folder: %s\n", params.dp->cache_file);
+        ensure_cache_dir(params.dp->cache_file);  // создать ./cache
     }
     INIT_ADDR_STR(params.laddr);
     LOG(LOG_S, "listen address: %s:%d\n", ADDR_STR, ntohs(params.laddr.in.sin_port));

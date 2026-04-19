@@ -52,13 +52,19 @@
 #define FM_RAND 1
 #define FM_ORIG 2
 
+#define GREASE_CIPHER   1
+#define GREASE_VERSION  2
+#define GREASE_GROUP    4
+#define GREASE_EXT      8
+
 enum demode {
     DESYNC_NONE,
     DESYNC_SPLIT,
     DESYNC_DISORDER,
     DESYNC_OOB,
     DESYNC_DISOOB,
-    DESYNC_FAKE
+    DESYNC_FAKE,
+    DESYNC_TLS_SPLIT
 };
 
 #ifdef STR_MODE
@@ -68,7 +74,8 @@ static const char *demode_str[] = {
     "DESYNC_DISORDER",
     "DESYNC_OOB",
     "DESYNC_DISOOB",
-    "DESYNC_FAKE"
+    "DESYNC_FAKE",
+    "DESYNC_TLS_SPLIT"
 };
 #endif
 
@@ -132,6 +139,8 @@ struct desync_params {
     const char *str;
     long cache_ttl;
     const char *cache_file;
+
+    int grease_mask;   // битовая маска: 1 - шифры, 2 - версии, 4 - группы, 8 - расширения
     
     struct desync_params *prev;
     struct desync_params *next;

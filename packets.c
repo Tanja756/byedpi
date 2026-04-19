@@ -1,3 +1,4 @@
+#include "params.h"
 #include "packets.h"
 
 #include <ctype.h>
@@ -14,6 +15,11 @@
     #include <arpa/inet.h>
 #endif
 
+// GREASE значения согласно RFC 8701
+static const uint16_t grease_ciphers[] = {0x0A0A, 0x1A1A, 0x2A2A, 0x3A2A};
+static const uint16_t grease_groups[]  = {0x0A0A, 0x1A1A, 0x2A2A};
+static const uint16_t grease_versions[]= {0x0A0A, 0x1A1A, 0x2A2A, 0x3A2A};
+static const uint16_t grease_exts[]    = {0x0A0A, 0x1A1A, 0x2A2A, 0x3A2A};
 
 char tls_data[517] = {
     "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03\x03\x5f"
@@ -617,4 +623,126 @@ void randomize_tls(char *buffer, ssize_t n)
         gen_rand_array(buffer + g_offs + 4, g_sz);
         g_offs += 4 + g_sz;
     }
+}
+void grease_tls(char *buffer, ssize_t n, int grease_mask)
+{
+    if (n < 44 || !grease_mask) return;
+    
+    size_t skip = find_ext_block(buffer, n);
+    if (!skip) return;
+    
+    // 1. GREASE шифров (cipher suites)
+    if (grease_mask & GREASE_CIPHER) {
+        uint8_t sid_len = buffer[43];
+        size_t cs_pos = 44 + sid_len;
+        if (cs_pos + 2 < n) {
+            uint16_t cs_len = ANTOHS(buffer, cs_pos);
+            if (cs_pos + 2 + cs_len <= n) {
+                // Заменяем каждый 5-й шифр на случайный GREASE
+                for (size_t i = 0; i + 1 < cs_len; i += 2) {
+                    if (rand() % 5 == 0) {
+                        uint16_t grease = grease_ciphers[rand() % 4];
+                        SHTONA(buffer, cs_pos + 2 + i, grease);
+                    }
+                }
+            }
+        }
+    }
+    
+    // 2. GREASE поддерживаемых групп (supported_groups)
+    if (grease_mask & GREASE_GROUP) {
+        ssize_t sg_offs = find_tls_ext_offset(0x000A, buffer, n, skip);
+        if (sg_offs && sg_offs + 6 < n) {
+            uint16_t sg_len = ANTOHS(buffer, sg_offs + 2);
+            if (sg_offs + 4 + sg_len <= n) {
+                // Вставляем GREASE группу в начало списка, если есть место
+                // Упрощённо: заменяем первую группу, если длина >= 2
+                if (sg_len >= 2) {
+                    uint16_t grease = grease_groups[rand() % 3];
+                    SHTONA(buffer, sg_offs + 4, grease);
+                }
+            }
+        }
+    }
+    
+    // 3. GREASE версий (supported_versions)
+    if (grease_mask & GREASE_VERSION) {
+        ssize_t sv_offs = find_tls_ext_offset(0x002B, buffer, n, skip);
+        if (sv_offs && sv_offs + 6 < n) {
+            uint16_t sv_len = ANTOHS(buffer, sv_offs + 2);
+            if (sv_offs + 5 < n) {
+                uint8_t ver_len = buffer[sv_offs + 4];
+                if (sv_offs + 5 + ver_len <= n && ver_len >= 2) {
+                    // Заменяем последнюю версию на GREASE
+                    size_t last_ver_offs = sv_offs + 5 + ver_len - 2;
+                    uint16_t grease = grease_versions[rand() % 4];
+                    SHTONA(buffer, last_ver_offs, grease);
+                }
+            }
+        }
+    }
+    
+    // 4. GREASE расширений (добавление пустого расширения с GREASE-типом)
+    if (grease_mask & GREASE_EXT) {
+        // Проверяем, есть ли свободное место в конце блока расширений (не менее 4 байт)
+        uint16_t ext_len = ANTOHS(buffer, skip);
+        if (skip + 2 + ext_len + 4 <= n) {
+            // Добавляем расширение типа GREASE с нулевой длиной
+            uint16_t grease_type = grease_exts[rand() % 4];
+            SHTONA(buffer, skip + 2 + ext_len, grease_type);
+            SHTONA(buffer, skip + 2 + ext_len + 2, 0);
+            // Увеличиваем общую длину расширений
+            SHTONA(buffer, skip, ext_len + 4);
+            // Корректируем длину записи и handshake (уже сделано в randomize_tls, но здесь нужно быть аккуратнее)
+            // В реальности это требует смещения всех последующих данных, что сложно.
+            // Поэтому ограничимся заменой существующего расширения, если оно есть.
+            // Для простоты заменяем первое попавшееся расширение с известным типом.
+            for (size_t off = skip + 2; off < skip + 2 + ext_len; ) {
+                uint16_t type = ANTOHS(buffer, off);
+                uint16_t len  = ANTOHS(buffer, off + 2);
+                if (type != 0x0000 && type != 0x002B && type != 0x000A && type != 0x0033) {
+                    // Заменяем на GREASE
+                    SHTONA(buffer, off, grease_exts[rand() % 4]);
+                    break;
+                }
+                off += 4 + len;
+            }
+        }
+    }
+}
+
+int split_tls_record(char *buffer, size_t bfsize, ssize_t *n, long pos)
+{
+    if (*n < 5 || pos <= 0 || pos >= *n - 5) return -1;
+    
+    uint8_t record_type = buffer[0];
+    uint16_t record_len = ANTOHS(buffer, 3);
+    if (5 + record_len != *n) return -1; // ожидаем ровно одну запись
+    
+    if (pos >= record_len) return -1;
+    
+    // Разделяем на две записи
+    uint16_t len1 = pos;
+    uint16_t len2 = record_len - pos;
+    
+    // Сдвигаем вторую часть, освобождая место под заголовок новой записи (5 байт)
+    if (*n + 5 > bfsize) return -1; // недостаточно места в буфере
+    
+    memmove(buffer + 5 + len1 + 5, buffer + 5 + len1, len2);
+    
+    // Первая запись
+    buffer[0] = record_type;
+    buffer[1] = buffer[1]; // версия не меняется
+    buffer[2] = buffer[2];
+    SHTONA(buffer, 3, len1);
+    
+    // Вторая запись
+    char *rec2 = buffer + 5 + len1;
+    rec2[0] = record_type;
+    rec2[1] = buffer[1];
+    rec2[2] = buffer[2];
+    SHTONA(rec2, 3, len2);
+    
+    *n += 5;
+    return 5; // возвращаем количество добавленных байт
 }
