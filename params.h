@@ -180,6 +180,9 @@ struct params {
     bool daemonize;
     const char *pid_file;
     int pid_fd;
+
+    const char *auth_file;
+    const char *auth_single;
 };
 
 extern struct params params;

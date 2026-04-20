@@ -30,8 +30,9 @@
     #define close(fd) closesocket(fd)
     #define mkdir(path, mode) _mkdir(path)
 #endif
+#include "socks5_auth.h"
 
-#define VERSION "17.3"
+#define VERSION "17.4"
 
 ASSERT(sizeof(struct in_addr) == 4)
 ASSERT(sizeof(struct in6_addr) == 16)
@@ -52,7 +53,7 @@ fake_udp = {
 struct params params = {
     .await_int = 10,
     
-    .ipv6 = 1,
+    .ipv6 = 0,
     .resolve = 1,
     .udp = 1,
     .max_open = 512,
@@ -200,6 +201,8 @@ const struct option options[] = {
     {"connect-to",    1, 0, 'C'},
     {"comment",       1, 0, '#'},
     {"cache-merge",   1, 0, '/'},
+{"auth-file",     1, 0, '1'}, // но 'a' уже занято, выберем 'J'
+{"auth",          1, 0, '2'},
     {0}
 };
     
@@ -708,6 +711,8 @@ void clear_params(char *line, char **argv)
     }
     params.need_free_n = 0;
     
+    socks5_auth_cleanup();
+
     struct desync_params *dp = params.dp;
     while (dp) {
         free(dp->parts);
@@ -1315,7 +1320,12 @@ int parse_args(int argc, char **argv)
             params.protect_path = optarg;
             break;
         #endif
-        case 0:
+        case '1':   // --auth-file
+            params.auth_file = optarg;
+           break;
+                
+        case '2':   // --auth
+            params.auth_single = optarg;
             break;
             
         case '?':
@@ -1438,9 +1448,19 @@ int main(int argc, char **argv)
     }
     
     int status = parse_args(argc, argv);
-    if (status) {
+
+     if (!params.dp) {
+        LOG(LOG_E, "No desync group created!\n");
+        return -1;
+    }
+   if (status) {
         clear_params(cmd_line, argv);
         return status - 1;
+    }
+
+    if (socks5_auth_init(params.auth_file, params.auth_single) < 0) {
+        clear_params(cmd_line, argv);
+        return -1;
     }
     
     set_default_cache();                // установить пути по умолчанию

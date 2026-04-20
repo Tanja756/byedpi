@@ -274,6 +274,12 @@ static bool check_proto_tcp(int proto, const char *buffer, ssize_t n)
 
 static bool check_l34(struct desync_params *dp, int st, const union sockaddr_u *dst)
 {
+    LOG(LOG_S, "check_l34: proto=%d, st=%d, port=%d\n", dp->proto, st, ntohs(dst->in.sin_port));
+    if ((dp->proto & IS_UDP) && (st != SOCK_DGRAM)) {
+        LOG(LOG_S, "check_l34: UDP mismatch\n");
+        return 0;
+    }
+
     if ((dp->proto & IS_UDP) && (st != SOCK_DGRAM)) {
         return 0;
     }
@@ -577,6 +583,7 @@ static struct desync_params *find_dp(struct eval *client,
         }
         client->dp_mask |= dp->bit;
     }
+    LOG(LOG_S, "find_dp returning dp=%p (id=%d)\n", dp, dp ? dp->id : -1);
     return 0;
 }
 
@@ -607,7 +614,7 @@ int connect_hook(struct poolhd *pool, struct eval *val,
     }
     struct desync_params *dp = find_dp(val, 0, 0, dst);
     if (!dp) {
-        LOG(LOG_E, "drop connection\n");
+        LOG(LOG_E, "connect_hook error at line %d\n", __LINE__);
         return -1;
     }
     val->dp = dp;
@@ -615,6 +622,7 @@ int connect_hook(struct poolhd *pool, struct eval *val,
     if ((dp->hosts || dp->proto) && !val->buff && params.delay_conn) {
         if (resp_error(val->fd, 0, val->flag) < 0) {
             uniperror("send");
+            LOG(LOG_E, "connect_hook error at line %d\n", __LINE__);
             return -1;
         }
         val->cb = &recv_and_connect;

@@ -53,6 +53,7 @@ typedef int (*evcb_t)(struct poolhd *, struct eval *, int);
 #define FLAG_S5 2
 #define FLAG_CONN 4
 #define FLAG_HTTP 8
+#define FLAG_AUTH 16  // дополнительный флаг для этапа аутентификации
 
 struct buffer {
     size_t size;
@@ -102,6 +103,8 @@ struct eval {
     const char *restore_orig;
     size_t restore_orig_len;
     unsigned int part_sent;
+
+    int auth_state;
 };
 
 struct poolhd {
@@ -149,10 +152,4 @@ void buff_push(struct poolhd *pool, struct buffer *buff);
 
 void buff_destroy(struct buffer *root);
 
-static struct buffer *buff_ppop(struct poolhd *pool, size_t size)
-{
-    struct buffer *b = buff_pop(pool, size);
-    if (b) buff_push(pool, b);
-    return b;
-}
 #endif

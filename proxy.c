@@ -1,4 +1,5 @@
 #include "proxy.h"
+#include "socks5_auth.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -142,6 +143,7 @@ static int resolve(const char *chost, int len,
     LOG(LOG_S, "resolve: %s\n", host);
     
     if (getaddrinfo(host, 0, &hints, &res) || !res) {
+        LOG(LOG_E, "resolve failed for %s\n", host);
         return -1;
     }
     memcpy(addr, res->ai_addr, SA_SIZE(res->ai_addr));
@@ -149,27 +151,6 @@ static int resolve(const char *chost, int len,
     
     return 0;
 }
-
-
-static int auth_socks5(int fd, const char *buffer, ssize_t n)
-{
-    if (n <= 2 || (uint8_t)buffer[1] != (n - 2)) {
-        return -1;
-    }
-    uint8_t c = S_AUTH_BAD;
-    for (long i = 2; i < n; i++)
-        if (buffer[i] == S_AUTH_NONE) {
-            c = S_AUTH_NONE;
-            break;
-        }
-    uint8_t a[2] = { S_VER5, c };
-    if (send(fd, (char *)a, sizeof(a), 0) < 0) {
-        uniperror("send");
-        return -1;
-    }
-    return c != S_AUTH_BAD ? 0 : -1;
-}
-
 
 static int resp_s5_error(int fd, int e)
 {
@@ -735,7 +716,8 @@ int on_tunnel(struct poolhd *pool, struct eval *val, int etype)
 
 int on_udp_tunnel(struct poolhd *pool, struct eval *val, int et)
 {
-    struct buffer *buff = buff_ppop(pool, params.bfsize);
+    // Было: struct buffer *buff = buff_ppop(pool, params.bfsize);
+    struct buffer *buff = buff_pop(pool, params.bfsize);
     if (!buff) {
         return -1;
     }
@@ -852,35 +834,72 @@ static int save_buffer(struct poolhd *pool,
 }
 
 
-static int handle_s5(struct poolhd *pool, struct eval *val, 
-            struct buffer *buff, ssize_t n, union sockaddr_u *dst)
+static int handle_s5(struct poolhd *pool, struct eval *val,
+                     struct buffer *buff, ssize_t n, union sockaddr_u *dst)
 {
-    if (val->flag != FLAG_S5) {
-        if (auth_socks5(val->fd, buff->data, n)) {
-            return -1;
+    // Возвращаемые значения:
+    //  0 - успех, буфер передан дальше (connect_hook)
+    //  1 - ошибка, буфер НЕ освобождён (вызывающая сторона должна освободить)
+    //  2 - промежуточное состояние, буфер уже освобождён, соединение продолжается
+    // -1 - критическая ошибка
+
+    if (!(val->flag & FLAG_S5)) {
+        unsigned int methods = 0;
+        int consumed = socks5_auth_handshake(val->fd, buff->data, n, &methods, &val->auth_state);
+        if (consumed < 0) return 1;
+        if (consumed == 0) return 1; // неполные данные - закрываем
+
+        if (methods & (1 << SOCKS5_AUTH_NONE)) {
+            val->flag = FLAG_S5;
+            if (consumed < n) {
+                memmove(buff->data, buff->data + consumed, n - consumed);
+                n -= consumed;
+            } else {
+                buff_push(pool, buff);
+                val->buff = NULL;
+                return 2;
+            }
+        } else if (methods & (1 << SOCKS5_AUTH_PASSWD)) {
+            val->flag = FLAG_S5 | FLAG_AUTH;
+            buff_push(pool, buff);
+            val->buff = NULL;
+            return 2;
+        } else {
+            return 1;
         }
-        val->flag = FLAG_S5;
-        return 0;
     }
+
+    if (val->flag & FLAG_AUTH) {
+        unsigned int dummy;
+        int consumed = socks5_auth_handshake(val->fd, buff->data, n, &dummy, &val->auth_state);
+        if (consumed < 0) return 1;
+        if (consumed == 0) return 1;
+        val->flag = FLAG_S5;
+        if (consumed < n) {
+            memmove(buff->data, buff->data + consumed, n - consumed);
+            n -= consumed;
+        } else {
+            buff_push(pool, buff);
+            val->buff = NULL;
+            return 2;
+        }
+    }
+
     if (n < S_SIZE_MIN) {
         LOG(LOG_E, "ss: request too small (%zd)\n", n);
-        return -1;
+        return 1;
     }
     struct s5_req *r = (struct s5_req *)buff->data;
     int s5e = 0;
     switch (r->cmd) {
         case S_CMD_CONN:
             s5e = s5_get_addr(buff->data, n, dst, SOCK_STREAM);
-            if (s5e >= 0) {
-                return connect_hook(pool, val, dst, &on_connect);
-            }
+            if (s5e >= 0) return 0; // буфер передан connect_hook
             break;
         case S_CMD_AUDP:
             if (params.udp) {
                 s5e = s5_get_addr(buff->data, n, dst, SOCK_DGRAM);
-                if (s5e >= 0) {
-                    return udp_associate(pool, val, dst);
-                }
+                if (s5e >= 0) return 0;
                 break;
             }
             __attribute__((fallthrough));
@@ -893,75 +912,125 @@ static int handle_s5(struct poolhd *pool, struct eval *val,
     return 1;
 }
 
-
 int on_request(struct poolhd *pool, struct eval *val, int et)
 {
     union sockaddr_u dst = { 0 };
-    struct buffer *buff = buff_ppop(pool, params.bfsize);
+    // Было: struct buffer *buff = buff_ppop(pool, params.bfsize);
+    struct buffer *buff = buff_pop(pool, params.bfsize);
     if (!buff) {
         return -1;
     }
     ssize_t n = recv(val->fd, buff->data, buff->size, 0);
     if (n < 1) {
+        buff_push(pool, buff);
         if (n) uniperror("ss recv");
         return -1;
     }
+
     int error = 0;
-    bool skip_conn = 0;
+    bool skip_conn = false;
     
     if ((params.mode & MODE_SOCKS5) && *buff->data == S_VER5) {
-        if ((error = handle_s5(pool, val, buff, n, &dst)) > 0) {
+        int ret = handle_s5(pool, val, buff, n, &dst);
+        if (ret < 0) {
+            buff_push(pool, buff);
             return -1;
+        } else if (ret == 1) {
+            buff_push(pool, buff);
+            return -1;
+        } else if (ret == 2) {
+            // Буфер уже освобождён внутри handle_s5, соединение продолжается
+            return 0;
         }
-        skip_conn = 1;
+        // ret == 0: буфер передан дальше (connect_hook)
+        skip_conn = true;
+    }
+    else if ((params.mode & MODE_SOCKS5) && 
+             (params.auth_file || params.auth_single) && 
+             *buff->data == SOCKS5_USERPASS_VER) 
+    {
+        // Клиент сразу отправляет user/pass, пропуская handshake методов
+        val->flag = FLAG_S5 | FLAG_AUTH;
+        int ret = handle_s5(pool, val, buff, n, &dst);
+        if (ret < 0) {
+            buff_push(pool, buff);
+            return -1;
+        } else if (ret == 1) {
+            buff_push(pool, buff);
+            return -1;
+        } else if (ret == 2) {
+            // Буфер уже освобождён, соединение продолжается
+            return 0;
+        }
+        skip_conn = true;
     }
     else if ((params.mode & MODE_SOCKS4) && *buff->data == S_VER4) {
         val->flag = FLAG_S4;
         error = s4_get_addr(buff->data, n, &dst);
+        if (error < 0) {
+            buff_push(pool, buff);
+            return -1;
+        }
     }
-    else if ((params.mode & MODE_HTTP)
-            && n > 7 && !memcmp(buff->data, "CONNECT", 7)) {
+    else if ((params.mode & MODE_HTTP) && n > 7 && !memcmp(buff->data, "CONNECT", 7)) {
         val->flag = FLAG_HTTP;
-        
         error = http_get_addr(buff->data, n, &dst);
+        if (error < 0) {
+            buff_push(pool, buff);
+            return -1;
+        }
     }
     else if ((params.mode & MODE_SHADOWSOCKS) && *buff->data <= S_ATP_I6) {
         int req_size = s5_get_addr(buff->data - 3, n + 3, &dst, SOCK_STREAM);
         if (req_size < 0) {
+            buff_push(pool, buff);
             return -1;
         }
         memmove(buff->data, buff->data + (req_size - 3), n - (req_size - 3));
         if (save_buffer(pool, val, buff, n - (req_size - 3))) {
+            buff_push(pool, buff);
             return -1;
         }
     }
     else if ((params.mode & MODE_RAWTLS) && is_tls_chello(buff->data, n)) {
         error = tls_get_addr(buff->data, n, &dst);
-        
-        if (!error && save_buffer(pool, val, buff, n)) {
+        if (error < 0) {
+            buff_push(pool, buff);
+            return -1;
+        }
+        if (save_buffer(pool, val, buff, n)) {
+            buff_push(pool, buff);
             return -1;
         }
     }
     else if ((params.mode & MODE_TCP)) {
         if (save_buffer(pool, val, buff, n)) {
+            buff_push(pool, buff);
             return -1;
         }
     }
     else {
         LOG(LOG_E, "ss: invalid version: 0x%x (%zd)\n", *buff->data, n);
+        buff_push(pool, buff);
         return -1;
     }
+
+INIT_ADDR_STR(dst);
+LOG(LOG_S, "calling connect_hook, dst=%s:%d\n", ADDR_STR, ntohs(dst.in.sin_port));
+error = connect_hook(pool, val, &dst, &on_connect);
+LOG(LOG_S, "connect_hook returned %d\n", error);
+
     if (!error && !skip_conn) {
         error = connect_hook(pool, val, &dst, &on_connect);
     }
     if (error) {
+        if (!val->buff) buff_push(pool, buff);
         if (resp_error(val->fd, ENOENT, val->flag) < 0)
             uniperror("send");
         return -1;
     }
     return 0;
 }
-
 
 int on_connect(struct poolhd *pool, struct eval *val, int et)
 {
